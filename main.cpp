@@ -29,6 +29,21 @@
 //      /link /LIBPATH:".\vcpkg\installed\x64-windows\lib" ^
 //      libssl.lib libcrypto.lib ws2_32.lib crypt32.lib
 
+// main.cpp - Binance Spot L2 (8-Thread / 9-Ring Arch) - 100ms & OPTIMIZED BUFFER
+// 
+// [최적화 설정]
+// 1. 스트림: "@depth@100ms" (0.1초 단위 수신, 안정적이고 충분히 빠름)
+// 2. 버퍼 크기: 65,536개 (약 1MB/큐)
+//    - 100ms 데이터 기준, 약 1.8시간 분량의 버퍼링 가능. 메모리 효율 최적.
+// 3. 쓰기 최적화: 64KB 배치 쓰기 유지.
+//
+// [빌드 (최적화 옵션 /O2 필수)]
+//   cl /nologo /EHsc /Zi /O2 /std:c++17 /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 main.cpp ^
+//      /I ".\vcpkg\installed\x64-windows\include" ^
+//      /Fo".\build\main.obj" /Fe".\build\orderbook_rt.exe" ^
+//      /link /LIBPATH:".\vcpkg\installed\x64-windows\lib" ^
+//      libssl.lib libcrypto.lib ws2_32.lib crypt32.lib
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
