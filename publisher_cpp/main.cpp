@@ -934,64 +934,156 @@ int main(int argc, char** argv)
                 std::cerr << "[WARN] cacert.pem not found. Using OS trust store.\n";
             }
 
+
             // ======================
-            //  Publisher 구성
+            //  Publisher 구성 (거래소별)
             // ======================
 
-            // (1) 파일 publisher
-            fs::path outp = fs::path("data") / "orderbook_clean.jsonl";
-            FilePublisher file_pub(outp);
+            // ---- Bybit ----
+            fs::path out_bybit = fs::path("data") / "orderbook_bybit.jsonl";
+            FilePublisher file_pub_bybit(out_bybit);
 
-            // (2) Kinesis publisher
-            KinesisPublisher kinesis_pub(
-                "orderbook-clean-stream",   // 사용 중인 Kinesis Stream Name
-                "ap-northeast-2"            // AWS Region
+            // Kinesis stream 이름은 실제로 만들어둔 이름으로 바꿔줘
+            KinesisPublisher kinesis_pub_bybit(
+                "orderbook-bybit",      // 예: Bybit 전용 Kinesis 스트림
+                "ap-northeast-2"
             );
 
-            // (3) MultiPublisher => 파일 + Kinesis 동시에 발행
-            MultiPublisher multi_pub;
-            multi_pub.add(&file_pub);
-            multi_pub.add(&kinesis_pub);
+            MultiPublisher multi_pub_bybit;
+            multi_pub_bybit.add(&file_pub_bybit);
+            multi_pub_bybit.add(&kinesis_pub_bybit);
+
+            // ---- Binance ----
+            fs::path out_binance = fs::path("data") / "orderbook_binance.jsonl";
+            FilePublisher file_pub_binance(out_binance);
+
+            KinesisPublisher kinesis_pub_binance(
+                "orderbook-binance",
+                "ap-northeast-2"
+            );
+
+            MultiPublisher multi_pub_binance;
+            multi_pub_binance.add(&file_pub_binance);
+            multi_pub_binance.add(&kinesis_pub_binance);
+
+            // ---- OKX ----
+            fs::path out_okx = fs::path("data") / "orderbook_okx.jsonl";
+            FilePublisher file_pub_okx(out_okx);
+
+            KinesisPublisher kinesis_pub_okx(
+                "orderbook-okx",
+                "ap-northeast-2"
+            );
+
+            MultiPublisher multi_pub_okx;
+            multi_pub_okx.add(&file_pub_okx);
+            multi_pub_okx.add(&kinesis_pub_okx);
 
             // ======================
             //  심볼별 SPSC 및 Validator 구성
             // ======================
 
-            struct SymbolPipe {
-                std::string sym;
-                std::unique_ptr<SPSC<4096>> qa;
-                std::unique_ptr<SPSC<4096>> qb;
-                std::unique_ptr<Validator>  val;
+                        // (거래소, 심볼) 별로 QA/QB + Validator를 따로 둔다.
+            struct ExchSymbolPipe {
+                std::string exch;   // "bybit", "binance", "okx"
+                std::string sym;    // "BTCUSDT", ...
+                std::unique_ptr<SPSC<4096>> qa;   // Ingestor A → Validator
+                std::unique_ptr<SPSC<4096>> qb;   // Ingestor B → Validator
+                std::unique_ptr<Validator>  val;  // A/B 머지(동일 거래소 내만)
             };
 
-            std::vector<SymbolPipe> pipes;
-            pipes.reserve(symbols.size());
+            std::vector<ExchSymbolPipe> pipes_bybit;
+            std::vector<ExchSymbolPipe> pipes_binance;
+            std::vector<ExchSymbolPipe> pipes_okx;
+
+            pipes_bybit.reserve(symbols.size());
+            pipes_binance.reserve(symbols.size());
+            pipes_okx.reserve(symbols.size());
+
+            // ======================
+            //  거래소별 SPSC 및 Validator 구성
+            // ======================
 
             for (auto& sym : symbols)
             {
-                SymbolPipe p;
-                p.sym = sym;
+                // ---- Bybit ----
+                {
+                    ExchSymbolPipe p;
+                    p.exch = "bybit";
+                    p.sym  = sym;
+                    p.qa   = std::make_unique<SPSC<4096>>();
+                    p.qb   = std::make_unique<SPSC<4096>>();
 
-                p.qa = std::make_unique<SPSC<4096>>();
-                p.qb = std::make_unique<SPSC<4096>>();
+                    p.val = std::make_unique<Validator>(
+                        "bybit",
+                        sym,
+                        p.qa.get(),                 // Bybit A
+                        p.qb.get(),                 // Bybit B
+                        &multi_pub_bybit,           // ✅ Bybit 전용 publisher
+                        0,
+                        std::chrono::milliseconds(5),
+                        std::chrono::milliseconds(20),
+                        &g_running
+                    );
 
-                // Validator(exchange, symbol, qa, qb, publisher, ...)
-                p.val = std::make_unique<Validator>(
-                    "multi",                     // exchange label (3개 거래소 통합 스트림)
-                    sym,                         // symbol
-                    p.qa.get(),                  // A side
-                    p.qb.get(),                  // B side
-                    &multi_pub,                  // MultiPublisher
-                    0,
-                    std::chrono::milliseconds(5),
-                    std::chrono::milliseconds(20),
-                    &g_running
-                );
+                    pipes_bybit.emplace_back(std::move(p));
+                }
 
-                pipes.emplace_back(std::move(p));
+                // ---- Binance ----
+                {
+                    ExchSymbolPipe p;
+                    p.exch = "binance";
+                    p.sym  = sym;
+                    p.qa   = std::make_unique<SPSC<4096>>();
+                    p.qb   = std::make_unique<SPSC<4096>>();
+
+                    p.val = std::make_unique<Validator>(
+                        "binance",
+                        sym,
+                        p.qa.get(),                 // Binance A
+                        p.qb.get(),                 // Binance B
+                        &multi_pub_binance,         // ✅ Binance 전용 publisher
+                        0,
+                        std::chrono::milliseconds(5),
+                        std::chrono::milliseconds(20),
+                        &g_running
+                    );
+
+                    pipes_binance.emplace_back(std::move(p));
+                }
+
+                // ---- OKX ----
+                {
+                    ExchSymbolPipe p;
+                    p.exch = "okx";
+                    p.sym  = sym;
+                    p.qa   = std::make_unique<SPSC<4096>>();
+                    p.qb   = std::make_unique<SPSC<4096>>();
+
+                    p.val = std::make_unique<Validator>(
+                        "okx",
+                        sym,
+                        p.qa.get(),                 // OKX A
+                        p.qb.get(),                 // OKX B
+                        &multi_pub_okx,             // ✅ OKX 전용 publisher
+                        0,
+                        std::chrono::milliseconds(5),
+                        std::chrono::milliseconds(20),
+                        &g_running
+                    );
+
+                    pipes_okx.emplace_back(std::move(p));
+                }
             }
 
+
+
             // ======================
+            //  거래소별 Ingestor 라우팅 테이블 생성
+            // ======================
+
+            // Bybit
+                        // ======================
             //  거래소별 Ingestor 라우팅 테이블 생성
             // ======================
 
@@ -1007,17 +1099,24 @@ int main(int argc, char** argv)
             std::unordered_map<std::string, SPSC<4096>*> routesA_okx;
             std::unordered_map<std::string, SPSC<4096>*> routesB_okx;
 
-            for (auto& p : pipes)
-            {
-                routesA_bybit[p.sym]   = p.qa.get();
-                routesB_bybit[p.sym]   = p.qb.get();
+            // Bybit: 심볼별 (A/B) 큐를 각자 라우팅
+            for (auto& p : pipes_bybit) {
+                routesA_bybit[p.sym] = p.qa.get();
+                routesB_bybit[p.sym] = p.qb.get();
+            }
 
+            // Binance
+            for (auto& p : pipes_binance) {
                 routesA_binance[p.sym] = p.qa.get();
                 routesB_binance[p.sym] = p.qb.get();
-
-                routesA_okx[p.sym]     = p.qa.get();
-                routesB_okx[p.sym]     = p.qb.get();
             }
+
+            // OKX
+            for (auto& p : pipes_okx) {
+                routesA_okx[p.sym] = p.qa.get();
+                routesB_okx[p.sym] = p.qb.get();
+            }
+
 
             // ======================
             // 3개 거래소 Ingestor A/B 생성
@@ -1056,7 +1155,14 @@ int main(int argc, char** argv)
             // ======================
             // Validator 시작
             // ======================
-            for (auto& p : pipes)
+                        // ======================
+            //  Validator 시작 (거래소별)
+            // ======================
+            for (auto& p : pipes_bybit)
+                p.val->start();
+            for (auto& p : pipes_binance)
+                p.val->start();
+            for (auto& p : pipes_okx)
                 p.val->start();
 
             std::cout << "Running... Press Ctrl + C to stop.\n";
@@ -1074,8 +1180,13 @@ int main(int argc, char** argv)
             binanceA.join(); binanceB.join();
             okxA.join();     okxB.join();
 
-            for (auto& p : pipes)
+            for (auto& p : pipes_bybit)
                 p.val->join();
+            for (auto& p : pipes_binance)
+                p.val->join();
+            for (auto& p : pipes_okx)
+                p.val->join();
+
 
             if (io_thread.joinable())
                 io_thread.join();
