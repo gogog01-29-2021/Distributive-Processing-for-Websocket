@@ -1,35 +1,42 @@
-OrderBook Real-Time System – 실행 환경 안내 (README.md)
+## 실행 환경 안내 (README.md)
 
 본 문서는 Binance / Bybit / OKX 멀티거래소 실시간 오더북 시스템을 Windows 환경에서 실행하기 위한 빌드 및 실행 환경 요구사항을 정리한 것입니다.
 
-✅ 1. 개발 및 실행 환경
-항목	설정
-OS	Windows 10 / 11 (64-bit)
-Compiler	MSVC (Visual Studio Build Tools) – cl.exe
-Package Manager	vcpkg (x64-windows triplet)
-OpenSSL	vcpkg 설치 버전 사용
-AWS SDK for C++	vcpkg 설치 버전 사용 (aws-cpp-sdk-core, aws-cpp-sdk-kinesis)
-C++ 표준	C++17
-CRT 종류	/MD (Dynamic CRT) 필수
-✅ 2. 필수 의존 라이브러리 (vcpkg)
+## 1. 개발 및 실행 환경
+| 항목 | 설정 |
+|------|------|
+| **OS** | Windows 10 / 11 (64-bit) |
+| **Compiler** | MSVC (cl.exe, Visual Studio Build Tools) |
+| **Package Manager** | vcpkg (`x64-windows`) |
+| **C++ Standard** | C++17 |
+| **CRT** | `/MD` (Dynamic CRT) |
+| **Dependencies** | OpenSSL, Boost.Beast, Boost.Asio, Boost.Lockfree, AWS SDK (C++), nlohmann-json |
+
+---
+
+## 2. 필수 의존 라이브러리 (vcpkg)
 
 다음 패키지들이 vcpkg에서 설치되어 있어야 한다.
 
+```
 vcpkg install openssl:x64-windows
 vcpkg install boost-beast:x64-windows
 vcpkg install boost-asio:x64-windows
+vcpkg install boost-lockfree:x64-windows
 vcpkg install aws-sdk-cpp[kinesis]:x64-windows
 vcpkg install nlohmann-json:x64-windows
-
+```
 
 설치 폴더 예시:
 
+```
 C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\
+```
 
-✅ 3. 빌드 설정 (VS Code tasks.json)
+## 3. 빌드 설정 (VS Code tasks.json)
 
 실제 사용 중인 빌드 설정:
-
+```
 {
   "version": "2.0.0",
   "tasks": [
@@ -77,11 +84,13 @@ C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\
     }
   ]
 }
+```
 
-✅ 4. 실행 시 필요한 DLL 목록
+## 4. 실행 시 필요한 DLL 목록
 
 vcpkg(동적 CRT) 기반이므로 exe 실행 시 다음 DLL들이 필요하다.
 
+```
 AWS SDK DLL
 
 aws-cpp-sdk-core.dll
@@ -109,9 +118,10 @@ OpenSSL DLL
 libssl-3-x64.dll
 
 libcrypto-3-x64.dll
+```
 
 Boost / 기타 DLL이 필요한 경우 자동 포함
-✅ 5. DLL 로딩 방식 (중요)
+## 5. DLL 로딩 방식 (중요)
 
 실행 파일이 정상 실행되기 위해서는 다음 중 한 가지 방식이 필수이다.
 
@@ -119,23 +129,31 @@ Boost / 기타 DLL이 필요한 경우 자동 포함
 
 PowerShell에서:
 
+```
 $env:PATH += ";C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin"
 .\orderbook_rt.exe
 
+```
+
 ✔️ 옵션 B: DLL을 exe 옆에 복사
+
+```
 cd C:\BIGDATA3\bigdata
 
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\aws-*.dll .
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\libssl-*.dll .
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\libcrypto-*.dll .
+```
 
-✅ 6. 실행 방법
+## 6. 실행 방법
+```
 cd C:\BIGDATA3\bigdata
 .\orderbook_rt.exe
-
+```
 
 실행되면 다음과 같은 로그가 출력된다:
-
+```
 Running (Binance + OKX + Bybit / Ingestor A/B / Validator per symbol)...
 [ingestor:binance:A] ...
 [validator:BTCUSDT] ...
+```
