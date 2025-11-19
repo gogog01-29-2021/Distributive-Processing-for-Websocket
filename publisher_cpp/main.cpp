@@ -1,5 +1,5 @@
 ﻿// main.cpp - Multi-exchange (Bybit / Binance / OKX) L2 order book:
-//            Ingestor A/B (multi-symbol) + per-symbol validators (per exchange)
+//            Ingestor A/B (multi-symbol) + per-symbol validators + writers (per exchange)
 //
 // Build (MSVC + vcpkg):
 //   cl /nologo /EHsc /Zi /std:c++17 /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 main.cpp ^
@@ -29,6 +29,8 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <stdexcept>
+#include <ctime>
 
 #include <aws/core/Aws.h>
 #include <aws/kinesis/KinesisClient.h>
@@ -84,6 +86,7 @@ static inline bool get_num(const json& v, double& out) {
     if (v.is_string())         { out = std::stod(v.get<std::string>()); return true; }
     return false;
 }
+
 static inline bool get_i64(const json& v, int64_t& out) {
     if (v.is_number_integer())  { out = v.get<int64_t>(); return true; }
     if (v.is_number_unsigned()) { out = static_cast<int64_t>(v.get<uint64_t>()); return true; }
@@ -96,12 +99,14 @@ static inline double now_sec() {
     using namespace std::chrono;
     return duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
+
 static inline uint64_t now_ms() {
     using namespace std::chrono;
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 }
+
 static inline std::string today_date() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
@@ -163,7 +168,7 @@ public:
         j["bids"] = arr(ev.bids);
         j["asks"] = arr(ev.asks);
         out_ << j.dump() << "\n";
-        // 필요하면 flush
+        // 필요하면 flush 활성화
         // out_.flush();
     }
 
@@ -240,7 +245,6 @@ public:
 private:
     std::vector<IPublisher*> targets_;
 };
-
 
 // 공통 HTTPS GET (주로 스냅샷용; Bybit에서 사용)
 static json https_get_json(asio::io_context& ioc, ssl::context& ssl_ctx,
@@ -323,57 +327,106 @@ class Validator {
 public:
     Validator(std::string exchange,
               std::string symbol,
-              SPSC<4096>* qa, SPSC<4096>* qb,
-              IPublisher* publisher,
-              int64_t /*start_seq*/ = 0,
+              SPSC<4096>* qa,
+              SPSC<4096>* qb,
+              SPSC<4096>* clean_q,
               std::chrono::milliseconds peer_wait = std::chrono::milliseconds(5),
               std::chrono::milliseconds idle_flush = std::chrono::milliseconds(20),
               std::atomic<bool>* running = nullptr,
               int core_id = -1)
-    : exch_(std::move(exchange)), sym_(std::move(symbol)),
-      qa_(qa), qb_(qb), pub_(publisher),
-      peer_wait_(peer_wait), idle_flush_(idle_flush),
-      running_(*running),
-      core_id_(core_id) {}
+        : exch_(std::move(exchange))
+        , sym_(std::move(symbol))
+        , qa_(qa)
+        , qb_(qb)
+        , clean_q_(clean_q)
+        , peer_wait_(peer_wait)
+        , idle_flush_(idle_flush)
+        , running_(running ? *running : dummy_running_)
+        , core_id_(core_id)
+    {}
 
     void start() {
-        th_ = std::thread([this]{
+        th_ = std::thread([this] {
             if (core_id_ >= 0) {
                 std::string role = "validator:" + exch_ + ":" + sym_;
                 pin_current_thread(role.c_str(), core_id_);
             }
             std::cout << "[validator:" << exch_ << ":" << sym_
                       << "] thread start (tid=" << std::this_thread::get_id() << ")\n";
-            this->run();
+            run();
         });
     }
-    void join()  { if(th_.joinable()) th_.join(); }
+
+    void join() {
+        if (th_.joinable()) th_.join();
+    }
 
 private:
+    // 시퀀스별 후보( A/B 중 더 좋은 것 ) 저장
     std::map<int64_t, DeltaPtr> hold_;
     std::map<int64_t, uint64_t> first_seen_ms_;
 
     std::string exch_;
     std::string sym_;
-    SPSC<4096>* qa_;
-    SPSC<4096>* qb_;
-    IPublisher* pub_;
+    SPSC<4096>* qa_;         // Ingestor A → Validator
+    SPSC<4096>* qb_;         // Ingestor B → Validator
+    SPSC<4096>* clean_q_;    // Validator → Writer
+
     std::chrono::milliseconds peer_wait_;
     std::chrono::milliseconds idle_flush_;
+    std::atomic<bool> dummy_running_{true};
     std::atomic<bool>& running_;
     std::thread th_;
     int core_id_;
 
-    void emit(const Delta& d) {
-        pub_->publish(d);
-        if (!d.bids.empty() || !d.asks.empty()) {
-            std::cout << "[clean:" << exch_ << ":" << sym_ << "] seq=" << d.seq
-                      << " t=" << std::fixed << std::setprecision(3) << d.event_ts
-                      << " recv=" << d.recv_ts << "\n";
+    // gap / 성능 통계
+    int64_t   last_seq_   = 0;
+    uint64_t  gap_count_  = 0;
+    uint64_t  dup_count_  = 0;
+    uint64_t  out_count_  = 0;
+    uint64_t  last_log_ms_ = 0;
+
+    void emit(const DeltaPtr& d) {
+        // clean 링 버퍼로 push (Writer가 소비)
+        while (running_.load() && !clean_q_->push(d)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+
+        // gap / 중복 체크
+        if (last_seq_ != 0) {
+            if (d->seq > last_seq_ + 1) {
+                ++gap_count_;
+                std::cerr << "[GAP:" << exch_ << ":" << sym_
+                          << "] last=" << last_seq_
+                          << " curr=" << d->seq << "\n";
+            } else if (d->seq <= last_seq_) {
+                ++dup_count_;
+            }
+        }
+        last_seq_ = d->seq;
+        ++out_count_;
+
+        if (!d->bids.empty() || !d->asks.empty()) {
+            std::cout << "[clean:" << exch_ << ":" << sym_
+                      << "] seq=" << d->seq
+                      << " t="    << std::fixed << std::setprecision(3) << d->event_ts
+                      << " recv=" << d->recv_ts << "\n";
+        }
+
+        // 1초마다 통계 로그
+        uint64_t now = now_ms();
+        if (now - last_log_ms_ >= 1000) {
+            std::cout << "[STAT:validator:" << exch_ << ":" << sym_
+                      << "] out=" << out_count_
+                      << " gap=" << gap_count_
+                      << " dup/oop=" << dup_count_
+                      << "\n";
+            out_count_ = 0;
+            last_log_ms_ = now;
         }
     }
 
-    void insert_or_choose(DeltaPtr d) {
+    void insert_or_choose(const DeltaPtr& d) {
         auto it = hold_.find(d->seq);
         if (it == hold_.end()) {
             hold_.emplace(d->seq, d);
@@ -395,10 +448,9 @@ private:
             auto it = hold_.begin();
             int64_t seq = it->first;
             uint64_t seen = first_seen_ms_[seq];
-            if (now_ms_val - seen < (uint64_t)peer_wait_.count()) {
+            if (now_ms_val - seen < (uint64_t)peer_wait_.count())
                 break;
-            }
-            emit(*(it->second));
+            emit(it->second);
             first_seen_ms_.erase(seq);
             hold_.erase(it);
         }
@@ -409,8 +461,15 @@ private:
 
         while (running_.load()) {
             DeltaPtr d;
-            if (qa_ && qa_->pop(d)) insert_or_choose(d);
-            if (qb_ && qb_->pop(d)) insert_or_choose(d);
+            bool got = false;
+            if (qa_ && qa_->pop(d)) {
+                insert_or_choose(d);
+                got = true;
+            }
+            if (qb_ && qb_->pop(d)) {
+                insert_or_choose(d);
+                got = true;
+            }
 
             uint64_t nowv = now_ms();
             flush_ready(nowv);
@@ -420,17 +479,98 @@ private:
                 last_idle_flush = nowv;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (!got) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
 
+        // 종료 시 남은 것 모두 방출
         for (auto& kv : hold_) {
-            emit(*(kv.second));
+            emit(kv.second);
         }
         hold_.clear();
         first_seen_ms_.clear();
     }
 };
 
+
+// ========== Writer (Validator → Publisher I/O 전담) ==========
+class Writer {
+public:
+    Writer(std::string exchange,
+           std::string symbol,
+           SPSC<4096>* clean_q,
+           IPublisher* publisher,
+           std::atomic<bool>& running,
+           int core_id = -1)
+    : exch_(std::move(exchange))
+    , sym_(std::move(symbol))
+    , clean_q_(clean_q)
+    , pub_(publisher)
+    , running_(running)
+    , core_id_(core_id)
+    {}
+
+    void start() {
+        th_ = std::thread([this]{
+            if (core_id_ >= 0) {
+                std::string role = "writer:" + exch_ + ":" + sym_;
+                pin_current_thread(role.c_str(), core_id_);
+            }
+            std::cout << "[writer:" << exch_ << ":" << sym_
+                      << "] thread start (tid=" << std::this_thread::get_id() << ")\n";
+            this->run();
+        });
+    }
+
+    void join() {
+        if (th_.joinable()) th_.join();
+    }
+
+private:
+    std::string        exch_;
+    std::string        sym_;
+    SPSC<4096>*        clean_q_;
+    IPublisher*        pub_;
+    std::atomic<bool>& running_;
+    std::thread        th_;
+    int                core_id_;
+
+    void run() {
+        uint64_t last_ts = now_ms();
+        uint64_t counter = 0; // 초당 처리량 측정용
+
+        while (running_.load()) {
+            DeltaPtr d;
+            if (clean_q_ && clean_q_->pop(d)) {
+                if (pub_ && d) {
+                    pub_->publish(*d);
+                    ++counter;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
+            uint64_t now = now_ms();
+            if (now - last_ts >= 1000) {
+                std::cout << "[TPS:" << exch_ << ":" << sym_
+                          << "] " << counter << " events/sec\n";
+                counter = 0;
+                last_ts = now;
+            }
+        }
+
+        // 종료 시 큐에 남아있는 데이터도 모두 처리
+        if (clean_q_) {
+            DeltaPtr d;
+            while (clean_q_->pop(d)) {
+                if (pub_ && d) {
+                    pub_->publish(*d);
+                }
+            }
+        }
+    }
+};
 
 // ========== 공통 Ingestor base ==========
 class IngestorBase {
@@ -442,14 +582,15 @@ public:
                  std::unordered_map<std::string, SPSC<4096>*> routes,
                  std::atomic<bool>& running,
                  int core_id = -1)
-    : exch_(std::move(exchange)),
-      ioc_(ioc),
-      ssl_(ssl_ctx),
-      inst_(std::move(instance_id)),
-      routes_(std::move(routes)),
-      running_(running),
-      core_id_(core_id) {}
-
+    : exch_(std::move(exchange))
+    , ioc_(ioc)
+    , ssl_(ssl_ctx)
+    , inst_(std::move(instance_id))
+    , routes_(std::move(routes))
+    , running_(running)
+    , core_id_(core_id)
+    {}
+    
     virtual ~IngestorBase() = default;
 
     void start() {
@@ -458,8 +599,8 @@ public:
                 std::string role = "ingestor:" + exch_ + ":" + inst_;
                 pin_current_thread(role.c_str(), core_id_);
             }
-            std::cout << "[ingestor:" << exch_ << ":" << inst_ << "] thread start (tid="
-                      << std::this_thread::get_id() << ")\n";
+            std::cout << "[ingestor:" << exch_ << ":" << inst_
+                      << "] thread start (tid=" << std::this_thread::get_id() << ")\n";
             this->run();
         });
     }
@@ -477,6 +618,25 @@ protected:
     std::atomic<bool>& running_;
     std::thread       th_;
     int core_id_;
+
+    std::atomic<uint64_t> produced_count_{0};
+    uint64_t last_tps_log_ms_{0};
+    
+    // 심볼별 push 성공 시 호출
+    void on_published_one() {
+        produced_count_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t now = now_ms();
+        if (last_tps_log_ms_ == 0) {
+            last_tps_log_ms_ = now;
+            return;
+        }
+        if (now - last_tps_log_ms_ >= 1000) {
+            auto n = produced_count_.exchange(0);
+            std::cout << "[TPS:ingestor:" << exch_ << ":" << inst_
+                      << "] " << n << " events/sec\n";
+            last_tps_log_ms_ = now;
+        }
+    }
 
     virtual void run() = 0;
 };
@@ -510,9 +670,13 @@ private:
                 d->recv_ts  = now_sec();
                 d->bids     = std::move(s.bids);
                 d->asks     = std::move(s.asks);
-                q->push(d);
-                std::cout << "[ingestor:bybit:" << inst_ << ":" << sym
-                          << "] snapshot pushed\n";
+                if (!q->push(d)) {
+                    std::cerr << "[WARN:bybit:" << inst_ << ":" << sym
+                              << "] snapshot drop (queue full)\n";
+                } else {
+                    std::cout << "[ingestor:bybit:" << inst_ << ":" << sym
+                              << "] snapshot pushed\n";
+                }
             } catch (const std::exception& e) {
                 std::cerr << "[ingestor:bybit:" << inst_ << ":" << sym
                           << "] snapshot error: " << e.what() << "\n";
@@ -521,6 +685,7 @@ private:
     }
 
     void run() override {
+        // 초기 스냅샷
         push_snapshot_for_all();
 
         while (running_.load()) {
@@ -621,7 +786,14 @@ private:
                                   << " seq=" << d->seq << " (publishing anyway)\n";
                     }
 
-                    outQ->push(d);
+                    if (!outQ->push(d)) {
+                        // 링버퍼가 꽉 차서 drop
+                        std::cerr << "[RING_FULL:" << exch_ << ":" << inst_ << ":" << sym
+                                << "] dropping delta seq=" << d->seq << "\n";
+                    } else {
+                        on_published_one(); // TPS 계측
+                    }
+
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[ingestor:bybit:" << inst_ << "] ws error: "
@@ -743,7 +915,13 @@ private:
                         std::cout << "\n";
                     }
 
-                    outQ->push(d);
+                    if (!outQ->push(d)) {
+                        std::cerr << "[RING_FULL:" << exch_ << ":" << inst_ << ":" << sym
+                                << "] dropping delta seq=" << d->seq << "\n";
+                    } else {
+                        on_published_one();
+                    }
+
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[ingestor:binance:" << inst_ << "] ws error: "
@@ -877,7 +1055,13 @@ private:
                         std::cout << "\n";
                     }
 
-                    outQ->push(d);
+                    if (!outQ->push(d)) {
+                        std::cerr << "[RING_FULL:" << exch_ << ":" << inst_ << ":" << sym
+                                << "] dropping delta seq=" << d->seq << "\n";
+                    } else {
+                        on_published_one();
+                    }
+
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[ingestor:okx:" << inst_ << "] ws error: "
@@ -888,36 +1072,32 @@ private:
     }
 };
 
-// ========== main ==========
+// ========== global running flag ==========
 static std::atomic<bool> g_running(true);
 
 void on_sigint(int) {
     g_running.store(false);
 }
 
+// ========== main ==========
 int main(int argc, char** argv)
 {
-    // ======================
-    //  AWS SDK 초기화
-    // ======================
     Aws::SDKOptions aws_options;
     Aws::InitAPI(aws_options);
 
     {
-        // 종료 신호
         std::signal(SIGINT, on_sigint);
     #ifdef SIGTERM
         std::signal(SIGTERM, on_sigint);
     #endif
 
-        // 심볼 리스트
         std::vector<std::string> symbols = {
             "BTCUSDT",
             "ETHUSDT",
             "SOLUSDT"
         };
 
-        std::cout << "Running (Binance + OKX + Bybit / Ingestor A/B / Validator per symbol)...\n";
+        std::cout << "Running (Binance + OKX + Bybit / Ingestor A/B / Validator + Writer per symbol)...\n";
 
         try {
             // ======================
@@ -934,7 +1114,6 @@ int main(int argc, char** argv)
                 std::cerr << "[WARN] cacert.pem not found. Using OS trust store.\n";
             }
 
-
             // ======================
             //  Publisher 구성 (거래소별)
             // ======================
@@ -943,9 +1122,8 @@ int main(int argc, char** argv)
             fs::path out_bybit = fs::path("data") / "orderbook_bybit.jsonl";
             FilePublisher file_pub_bybit(out_bybit);
 
-            // Kinesis stream 이름은 실제로 만들어둔 이름으로 바꿔줘
             KinesisPublisher kinesis_pub_bybit(
-                "orderbook-bybit",      // 예: Bybit 전용 Kinesis 스트림
+                "orderbook-bybit",
                 "ap-northeast-2"
             );
 
@@ -980,16 +1158,21 @@ int main(int argc, char** argv)
             multi_pub_okx.add(&kinesis_pub_okx);
 
             // ======================
-            //  심볼별 SPSC 및 Validator 구성
+            //  (거래소, 심볼) 별 파이프 구성
             // ======================
-
-                        // (거래소, 심볼) 별로 QA/QB + Validator를 따로 둔다.
             struct ExchSymbolPipe {
                 std::string exch;   // "bybit", "binance", "okx"
                 std::string sym;    // "BTCUSDT", ...
-                std::unique_ptr<SPSC<4096>> qa;   // Ingestor A → Validator
-                std::unique_ptr<SPSC<4096>> qb;   // Ingestor B → Validator
-                std::unique_ptr<Validator>  val;  // A/B 머지(동일 거래소 내만)
+
+                // Ingestor A/B → Validator
+                std::unique_ptr<SPSC<4096>> qa;
+                std::unique_ptr<SPSC<4096>> qb;
+
+                // Validator → Writer
+                std::unique_ptr<SPSC<4096>> qc;
+
+                std::unique_ptr<Validator> val;
+                std::unique_ptr<Writer>    writer;
             };
 
             std::vector<ExchSymbolPipe> pipes_bybit;
@@ -1001,7 +1184,7 @@ int main(int argc, char** argv)
             pipes_okx.reserve(symbols.size());
 
             // ======================
-            //  거래소별 SPSC 및 Validator 구성
+            //  거래소별 SPSC 및 Validator/Writer 구성
             // ======================
 
             for (auto& sym : symbols)
@@ -1013,17 +1196,29 @@ int main(int argc, char** argv)
                     p.sym  = sym;
                     p.qa   = std::make_unique<SPSC<4096>>();
                     p.qb   = std::make_unique<SPSC<4096>>();
+                    p.qc   = std::make_unique<SPSC<4096>>();
 
+                    // A/B -> Validator -> qc
                     p.val = std::make_unique<Validator>(
                         "bybit",
                         sym,
-                        p.qa.get(),                 // Bybit A
-                        p.qb.get(),                 // Bybit B
-                        &multi_pub_bybit,           // ✅ Bybit 전용 publisher
-                        0,
-                        std::chrono::milliseconds(5),
-                        std::chrono::milliseconds(20),
-                        &g_running
+                        p.qa.get(),                      // A
+                        p.qb.get(),                      // B
+                        p.qc.get(),                      // clean_q
+                        std::chrono::milliseconds(5),    // peer_wait
+                        std::chrono::milliseconds(20),   // idle_flush
+                        &g_running,
+                        -1                               // core_id (코어 핀 안 쓸 거면 -1)
+                    );
+
+                    // qc -> Writer -> MultiPublisher(파일 + Kinesis)
+                    p.writer = std::make_unique<Writer>(
+                        "bybit",
+                        sym,
+                        p.qc.get(),                      // Validator → qc → Writer
+                        &multi_pub_bybit,
+                        g_running,
+                        -1
                     );
 
                     pipes_bybit.emplace_back(std::move(p));
@@ -1036,21 +1231,32 @@ int main(int argc, char** argv)
                     p.sym  = sym;
                     p.qa   = std::make_unique<SPSC<4096>>();
                     p.qb   = std::make_unique<SPSC<4096>>();
+                    p.qc   = std::make_unique<SPSC<4096>>();
 
                     p.val = std::make_unique<Validator>(
                         "binance",
                         sym,
-                        p.qa.get(),                 // Binance A
-                        p.qb.get(),                 // Binance B
-                        &multi_pub_binance,         // ✅ Binance 전용 publisher
-                        0,
+                        p.qa.get(),
+                        p.qb.get(),
+                        p.qc.get(),
                         std::chrono::milliseconds(5),
                         std::chrono::milliseconds(20),
-                        &g_running
+                        &g_running,
+                        -1
+                    );
+
+                    p.writer = std::make_unique<Writer>(
+                        "binance",
+                        sym,
+                        p.qc.get(),
+                        &multi_pub_binance,
+                        g_running,
+                        -1
                     );
 
                     pipes_binance.emplace_back(std::move(p));
                 }
+
 
                 // ---- OKX ----
                 {
@@ -1059,31 +1265,34 @@ int main(int argc, char** argv)
                     p.sym  = sym;
                     p.qa   = std::make_unique<SPSC<4096>>();
                     p.qb   = std::make_unique<SPSC<4096>>();
+                    p.qc   = std::make_unique<SPSC<4096>>();
 
                     p.val = std::make_unique<Validator>(
                         "okx",
                         sym,
-                        p.qa.get(),                 // OKX A
-                        p.qb.get(),                 // OKX B
-                        &multi_pub_okx,             // ✅ OKX 전용 publisher
-                        0,
+                        p.qa.get(),
+                        p.qb.get(),
+                        p.qc.get(),
                         std::chrono::milliseconds(5),
                         std::chrono::milliseconds(20),
-                        &g_running
+                        &g_running,
+                        -1
+                    );
+
+                    p.writer = std::make_unique<Writer>(
+                        "okx",
+                        sym,
+                        p.qc.get(),
+                        &multi_pub_okx,
+                        g_running,
+                        -1
                     );
 
                     pipes_okx.emplace_back(std::move(p));
                 }
             }
 
-
-
             // ======================
-            //  거래소별 Ingestor 라우팅 테이블 생성
-            // ======================
-
-            // Bybit
-                        // ======================
             //  거래소별 Ingestor 라우팅 테이블 생성
             // ======================
 
@@ -1099,24 +1308,18 @@ int main(int argc, char** argv)
             std::unordered_map<std::string, SPSC<4096>*> routesA_okx;
             std::unordered_map<std::string, SPSC<4096>*> routesB_okx;
 
-            // Bybit: 심볼별 (A/B) 큐를 각자 라우팅
             for (auto& p : pipes_bybit) {
                 routesA_bybit[p.sym] = p.qa.get();
                 routesB_bybit[p.sym] = p.qb.get();
             }
-
-            // Binance
             for (auto& p : pipes_binance) {
                 routesA_binance[p.sym] = p.qa.get();
                 routesB_binance[p.sym] = p.qb.get();
             }
-
-            // OKX
             for (auto& p : pipes_okx) {
                 routesA_okx[p.sym] = p.qa.get();
                 routesB_okx[p.sym] = p.qb.get();
             }
-
 
             // ======================
             // 3개 거래소 Ingestor A/B 생성
@@ -1153,17 +1356,15 @@ int main(int argc, char** argv)
             okxB.start();
 
             // ======================
-            // Validator 시작
+            // Validator & Writer 시작
             // ======================
-                        // ======================
-            //  Validator 시작 (거래소별)
-            // ======================
-            for (auto& p : pipes_bybit)
-                p.val->start();
-            for (auto& p : pipes_binance)
-                p.val->start();
-            for (auto& p : pipes_okx)
-                p.val->start();
+            for (auto& p : pipes_bybit)   p.val->start();
+            for (auto& p : pipes_binance) p.val->start();
+            for (auto& p : pipes_okx)     p.val->start();
+
+            for (auto& p : pipes_bybit)   p.writer->start();
+            for (auto& p : pipes_binance) p.writer->start();
+            for (auto& p : pipes_okx)     p.writer->start();
 
             std::cout << "Running... Press Ctrl + C to stop.\n";
 
@@ -1180,13 +1381,13 @@ int main(int argc, char** argv)
             binanceA.join(); binanceB.join();
             okxA.join();     okxB.join();
 
-            for (auto& p : pipes_bybit)
-                p.val->join();
-            for (auto& p : pipes_binance)
-                p.val->join();
-            for (auto& p : pipes_okx)
-                p.val->join();
+            for (auto& p : pipes_bybit)   p.val->join();
+            for (auto& p : pipes_binance) p.val->join();
+            for (auto& p : pipes_okx)     p.val->join();
 
+            for (auto& p : pipes_bybit)   p.writer->join();
+            for (auto& p : pipes_binance) p.writer->join();
+            for (auto& p : pipes_okx)     p.writer->join();
 
             if (io_thread.joinable())
                 io_thread.join();
