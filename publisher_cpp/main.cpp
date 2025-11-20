@@ -1,4 +1,4 @@
-﻿﻿// main.cpp - Multi-exchange (Bybit / Binance / OKX) L2 order book:
+﻿// main.cpp - Multi-exchange (Bybit / Binance / OKX) L2 order book:
 //            Ingestor A/B (multi-symbol) + per-symbol validators + writers (per exchange)
 //
 // Build (MSVC + vcpkg):
