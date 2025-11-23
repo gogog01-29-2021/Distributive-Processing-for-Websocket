@@ -10,7 +10,7 @@
 | **Package Manager** | vcpkg (`x64-windows`) |
 | **C++ Standard** | C++17 |
 | **CRT** | `/MD` (Dynamic CRT) |
-| **Dependencies** | OpenSSL, Boost.Beast, Boost.Asio, Boost.Lockfree, AWS SDK (C++), nlohmann-json |
+| **Dependencies** | OpenSSL, Boost.Beast, Boost.Asio, Boost.Lockfree, AWS SDK (C++), nlohmann-json ,protobuf|
 
 ---
 
@@ -25,6 +25,7 @@ vcpkg install boost-asio:x64-windows
 vcpkg install boost-lockfree:x64-windows
 vcpkg install aws-sdk-cpp[kinesis]:x64-windows
 vcpkg install nlohmann-json:x64-windows
+vcpkg install protobuf:x64-windows
 ```
 
 설치 폴더 예시:
@@ -69,7 +70,8 @@ C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\
         "Ws2_32.lib",
         "Crypt32.lib",
         "aws-cpp-sdk-kinesis.lib",
-        "aws-cpp-sdk-core.lib"
+        "aws-cpp-sdk-core.lib",
+        "abseil_dll.lib", //protobuf 설치 후 vcpkg 설치경로에서 absl_*.lib 검색후 복사 및 추가
       ],
       "options": {
         "cwd": "C:/BIGDATA3/bigdata"
@@ -118,6 +120,12 @@ OpenSSL DLL
 libssl-3-x64.dll
 
 libcrypto-3-x64.dll
+
+libprotobuf.dll
+
+libprotoc.dll
+
+libprotobuf-lite.dll
 ```
 
 Boost / 기타 DLL이 필요한 경우 자동 포함
@@ -143,12 +151,13 @@ cd C:\BIGDATA3\bigdata
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\aws-*.dll .
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\libssl-*.dll .
 copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\libcrypto-*.dll .
+copy C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\bin\*.dll .
 ```
 
 ## 6. 실행 방법
 ```
 cd C:\BIGDATA3\bigdata
-.\orderbook_rt.exe
+.\orderbook_rt.exe binance
 ```
 
 실행되면 다음과 같은 로그가 출력된다:
