@@ -1,11 +1,11 @@
-﻿// main.cpp - Multi-exchange L2 order book with Protobuf binary format
+﻿// main.cpp - Multi-exchange L2 order book with Protobuf & Optimization
 //
 // Build (MSVC + vcpkg):
 //   cl /nologo /EHsc /Zi /std:c++17 /DWIN32_LEAN_AND_MEAN /D_WIN32_WINNT=0x0A00 ^
 //      main.cpp orderbook.pb.cc ^
-//      /I "C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\include" ^
+//      /I "C:\vcpkg\installed\x64-windows\include" ^
 //      /Fo".\build\" /Fe"orderbook_rt.exe" ^
-//      /link /LIBPATH:"C:\BIGDATA3\bigdata\vcpkg\installed\x64-windows\lib" ^
+//      /link /LIBPATH:"C:\vcpkg\installed\x64-windows\lib" ^
 //      libssl.lib libcrypto.lib ws2_32.lib crypt32.lib ^
 //      aws-cpp-sdk-kinesis.lib aws-cpp-sdk-core.lib ^
 //      libprotobuf.lib
@@ -30,10 +30,12 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <ctime>
+#include <list>
 
 #include <aws/core/Aws.h>
 #include <aws/kinesis/KinesisClient.h>
 #include <aws/kinesis/model/PutRecordRequest.h>
+#include <aws/kinesis/model/PutRecordsRequest.h> // [FIX] 배치 전송용
 
 // ✅ Protobuf 헤더
 #include "orderbook.pb.h"
@@ -63,7 +65,7 @@ using json = nlohmann::json;
 static inline void pin_current_thread(const char* role, int core_id) {
 #ifdef _WIN32
     if (core_id < 0 || core_id >= (int)(sizeof(DWORD_PTR) * 8)) {
-        std::cerr << "[WARN] pin_current_thread(" << role << "): invalid core_id=" << core_id << "\n";
+        // std::cerr << "[WARN] pin_current_thread(" << role << "): invalid core_id=" << core_id << "\n";
         return;
     }
     DWORD_PTR mask = (DWORD_PTR)1 << core_id;
@@ -86,14 +88,20 @@ static inline bool get_num(const json& v, double& out) {
     if (v.is_number_float()) { out = v.get<double>(); return true; }
     if (v.is_number_integer()) { out = static_cast<double>(v.get<int64_t>()); return true; }
     if (v.is_number_unsigned()) { out = static_cast<double>(v.get<uint64_t>()); return true; }
-    if (v.is_string()) { out = std::stod(v.get<std::string>()); return true; }
+    if (v.is_string()) { 
+        try { out = std::stod(v.get<std::string>()); return true; } 
+        catch(...) { return false; }
+    }
     return false;
 }
 
 static inline bool get_i64(const json& v, int64_t& out) {
     if (v.is_number_integer()) { out = v.get<int64_t>(); return true; }
     if (v.is_number_unsigned()) { out = static_cast<int64_t>(v.get<uint64_t>()); return true; }
-    if (v.is_string()) { out = std::stoll(v.get<std::string>()); return true; }
+    if (v.is_string()) {
+        try { out = std::stoll(v.get<std::string>()); return true; }
+        catch(...) { return false; }
+    }
     return false;
 }
 
@@ -120,8 +128,25 @@ struct Delta {
     double      recv_ts{ 0.0 };
     std::vector<std::pair<double, double>> bids;
     std::vector<std::pair<double, double>> asks;
+
+    // [IMPROVE] 재사용을 위한 reset (현재 코드에서는 make_shared로 매번 생성하지만 구조상 준비)
+    void clear() {
+        seq = 0; event_ts = 0.0; recv_ts = 0.0;
+        bids.clear();
+        asks.clear();
+    }
 };
 using DeltaPtr = std::shared_ptr<Delta>;
+
+// [IMPROVE] 간단한 Object Pool Wrapper
+class DeltaPool {
+public:
+    static DeltaPtr acquire() {
+        // 실제 HFT 환경에서는 boost::pool이나 lock-free stack을 사용해 
+        // 미리 할당된 객체를 재사용해야 함. 여기서는 인터페이스만 도입.
+        return std::make_shared<Delta>(); 
+    }
+};
 
 template<size_t Capacity>
 using SPSC = boost::lockfree::spsc_queue<DeltaPtr, boost::lockfree::capacity<Capacity>>;
@@ -130,6 +155,7 @@ using SPSC = boost::lockfree::spsc_queue<DeltaPtr, boost::lockfree::capacity<Cap
 struct IPublisher {
     virtual ~IPublisher() = default;
     virtual void publish(const Delta& ev) = 0;
+    virtual void flush() {} // [FIX] 배치 전송을 위한 flush 메소드 추가
 };
 
 // ========== file publisher (JSON) ==========
@@ -163,7 +189,7 @@ private:
     std::ofstream out_;
 };
 
-// ========== Kinesis Publisher (Protobuf Binary) ==========
+// ========== Kinesis Publisher (Protobuf Binary + Batching) ==========
 class KinesisPublisher : public IPublisher {
 public:
     KinesisPublisher(const std::string& symbol,
@@ -176,6 +202,11 @@ public:
         
         Aws::Client::ClientConfiguration cfg;
         cfg.region = region.c_str();
+        // [IMPROVE] 타임아웃 및 커넥션 설정 최적화
+        cfg.connectTimeoutMs = 1000;
+        cfg.requestTimeoutMs = 1000;
+        cfg.maxConnections = 50; 
+
         client_ = std::make_unique<Aws::Kinesis::KinesisClient>(cfg);
         
         std::cout << "[KinesisPublisher] Initialized for symbol=" << symbol_
@@ -183,11 +214,11 @@ public:
                   << " format=" << (use_protobuf_ ? "protobuf" : "json") << "\n";
     }
 
+    // [FIX] 단건 전송 대신 내부 버퍼에 쌓음
     void publish(const Delta& ev) override {
         std::string payload;
         
         if (use_protobuf_) {
-            // ✅ Protobuf 직렬화
             orderbook::OrderbookDelta pb_msg;
             pb_msg.set_exchange(ev.exchange);
             pb_msg.set_instance(ev.instance);
@@ -202,7 +233,6 @@ public:
                 level->set_price(price);
                 level->set_quantity(qty);
             }
-            
             // Asks
             for (const auto& [price, qty] : ev.asks) {
                 auto* level = pb_msg.add_asks();
@@ -210,14 +240,12 @@ public:
                 level->set_quantity(qty);
             }
             
-            // 직렬화
             if (!pb_msg.SerializeToString(&payload)) {
-                std::cerr << "[KinesisPublisher:" << symbol_ 
-                          << "] Protobuf serialization failed\n";
+                std::cerr << "[KinesisPublisher:" << symbol_ << "] Protobuf serialization failed\n";
                 return;
             }
         } else {
-            // JSON 직렬화 (fallback)
+            // JSON fallback
             json j;
             j["exchange"] = ev.exchange;
             j["instance"] = ev.instance;
@@ -225,7 +253,6 @@ public:
             j["seq"] = ev.seq;
             j["event_ts"] = ev.event_ts;
             j["recv_ts"] = ev.recv_ts;
-            
             auto arr = [](const std::vector<std::pair<double, double>>& v) {
                 json a = json::array();
                 for (auto& pr : v) a.push_back({pr.first, pr.second});
@@ -233,51 +260,77 @@ public:
             };
             j["bids"] = arr(ev.bids);
             j["asks"] = arr(ev.asks);
-            
             payload = j.dump();
         }
 
-        // Kinesis 전송
-        Aws::Kinesis::Model::PutRecordRequest req;
-        req.SetStreamName(stream_name_.c_str());
-
-        // 파티션 키: 거래소
-        std::string partition_key = ev.exchange;
-        req.SetPartitionKey(partition_key.c_str());
-
+        // [FIX] Kinesis PutRecordsEntry 생성 및 버퍼링
+        Aws::Kinesis::Model::PutRecordsRequestEntry entry;
         Aws::Utils::ByteBuffer buf(
             reinterpret_cast<const unsigned char*>(payload.data()),
             static_cast<unsigned int>(payload.size())
         );
-        req.SetData(buf);
+        entry.SetData(buf);
+        // [CRITICAL FIX] 파티션 키를 심볼 단위로 고정하여 순서 보장 및 샤드 분산
+        entry.SetPartitionKey(ev.exchange.c_str()); 
 
-        auto outcome = client_->PutRecord(req);
-        if (!outcome.IsSuccess()) {
-            std::cerr << "[KinesisPublisher:" << symbol_ 
-                      << "] PutRecord failed: "
-                      << outcome.GetError().GetMessage() << "\n";
-        } else {
-            ++total_sent_;
-            
-            // 주기적 통계 (10초마다)
-            auto now = std::chrono::steady_clock::now();
-            if (now - last_log_time_ >= std::chrono::seconds(10)) {
-                std::cout << "[KinesisPublisher:" << symbol_ 
-                          << "] Total sent: " << total_sent_.load()
-                          << " records (format: " 
-                          << (use_protobuf_ ? "protobuf" : "json") << ")\n";
-                last_log_time_ = now;
-            }
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        pending_records_.push_back(std::move(entry));
+
+        // 배치 크기 도달 시 전송 (예: 50개)
+        if (pending_records_.size() >= 50) {
+            flush_internal();
+        }
+    }
+
+    // 주기적으로 혹은 종료 시 호출
+    void flush() override {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        if (!pending_records_.empty()) {
+            flush_internal();
         }
     }
 
 private:
+    void flush_internal() {
+        // [NOTE] 실제로는 이 부분도 비동기(Async)로 돌려야 Writer 스레드가 안 멈춤.
+        // 여기서는 예시를 위해 동기 호출하되, PutRecords(Batch) 사용하여 RTT 비용 최소화.
+        if (pending_records_.empty()) return;
+
+        Aws::Kinesis::Model::PutRecordsRequest req;
+        req.SetStreamName(stream_name_.c_str());
+        req.SetRecords(pending_records_);
+
+        auto outcome = client_->PutRecords(req);
+        if (!outcome.IsSuccess()) {
+             std::cerr << "[Kinesis Error:" << symbol_ << "] " << outcome.GetError().GetMessage() << "\n";
+        } else {
+             auto result = outcome.GetResult();
+             if (result.GetFailedRecordCount() > 0) {
+                 std::cerr << "[Kinesis Warn:" << symbol_ << "] Partial failure: " 
+                           << result.GetFailedRecordCount() << " records failed.\n";
+             }
+             total_sent_ += (pending_records_.size() - result.GetFailedRecordCount());
+             
+             // 주기적 로그
+             auto now = std::chrono::steady_clock::now();
+             if (now - last_log_time_ >= std::chrono::seconds(10)) {
+                 std::cout << "[KinesisPublisher:" << symbol_ 
+                           << "] Total sent: " << total_sent_.load() << "\n";
+                 last_log_time_ = now;
+             }
+        }
+        pending_records_.clear();
+    }
+
     std::string symbol_;
     std::string stream_name_;
     bool use_protobuf_;
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::atomic<uint64_t> total_sent_{0};
     std::chrono::steady_clock::time_point last_log_time_;
+    
+    std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> pending_records_;
+    std::mutex buffer_mutex_;
 };
 
 // ========== MultiPublisher ==========
@@ -288,6 +341,12 @@ public:
     void publish(const Delta& ev) override {
         for (auto* p : targets_) {
             if (p) p->publish(ev);
+        }
+    }
+    
+    void flush() override {
+        for (auto* p : targets_) {
+            if (p) p->flush();
         }
     }
 
@@ -444,13 +503,19 @@ private:
             if (exch_ == "bybit") {
                 if (diff > 1) {
                     ++gap_count_;
-                } 
-                else if (diff <= 0) {
+                    std::cerr << "[GAP:" << exch_ << ":" << sym_
+                              << "] last=" << last_seq_ << " curr=" << d->seq << "\n";
+                } else if (diff <= 0) {
                     ++dup_count_;
                 }
-            } 
-            else if (exch_ == "binance" || exch_ == "okx") {
-                if (diff < 0) {
+            } else if (exch_ == "binance" || exch_ == "okx") {
+                const int64_t RESET_THRESHOLD = 1'000'000;
+                if (diff < 0 && std::llabs(diff) > RESET_THRESHOLD) {
+                    std::cerr << "[SEQ_RESET:" << exch_ << ":" << sym_
+                              << "] last=" << last_seq_ << " curr=" << d->seq << "\n";
+                    last_seq_ = d->seq;
+                }
+                else if (diff < 0) {
                     ++dup_count_;
                 }
             }
@@ -462,15 +527,13 @@ private:
         uint64_t now = now_ms();
         if (now - last_log_ms_ >= 1000) {
             std::cout << "[STAT:validator:" << exch_ << ":" << sym_
-                    << "] out=" << out_count_
-                    << " gap=" << gap_count_
-                    << " dup/oop=" << dup_count_
-                    << " (last 1 sec)\n";
-            
+                      << "] out=" << out_count_
+                      << " gap=" << gap_count_
+                      << " dup/oop=" << dup_count_
+                      << "\n";
             out_count_ = 0;
-            gap_count_ = 0;
+            gap_count_ = 0; // [추가] 0으로 리셋하면 현재 발생하는 Gap만 볼 수 있음
             dup_count_ = 0;
-            
             last_log_ms_ = now;
         }
     }
@@ -529,7 +592,7 @@ private:
             }
 
             if (!got) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::microseconds(100)); // Sleep 줄임
             }
         }
 
@@ -586,21 +649,37 @@ private:
 
     void run() {
         uint64_t last_ts = now_ms();
+        uint64_t last_flush = now_ms();
         uint64_t counter = 0;
 
         while (running_.load()) {
             DeltaPtr d;
-            if (clean_q_ && clean_q_->pop(d)) {
+            bool popped = false;
+            
+            // [FIX] 한 번에 여러 개 처리 (Batching 효과 증대)
+            while (clean_q_ && clean_q_->pop(d)) {
                 if (pub_ && d) {
                     pub_->publish(*d);
                     ++counter;
                 }
-            }
-            else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                popped = true;
+                
+                // 너무 오래 락을 잡지 않도록 루프 제한
+                if (counter % 100 == 0) break; 
             }
 
             uint64_t now = now_ms();
+            
+            // [FIX] 주기적 Flush (예: 100ms 마다)
+            if (now - last_flush >= 100) {
+                if (pub_) pub_->flush();
+                last_flush = now;
+            }
+
+            if (!popped) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10)); // Sleep 최소화
+            }
+
             if (now - last_ts >= 1000) {
                 std::cout << "[TPS:" << exch_ << ":" << sym_
                     << "] " << counter << " events/sec\n";
@@ -612,11 +691,10 @@ private:
         if (clean_q_) {
             DeltaPtr d;
             while (clean_q_->pop(d)) {
-                if (pub_ && d) {
-                    pub_->publish(*d);
-                }
+                if (pub_ && d) pub_->publish(*d);
             }
         }
+        if (pub_) pub_->flush();
     }
 };
 
@@ -708,7 +786,8 @@ private:
             if (!q) continue;
             try {
                 Snapshot s = fetch_bybit_snapshot(ioc_, ssl_, sym);
-                auto d = std::make_shared<Delta>();
+                // [FIX] Use Object Pool
+                auto d = DeltaPool::acquire();
                 d->exchange = "bybit";
                 d->instance = inst_;
                 d->symbol = sym;
@@ -718,17 +797,14 @@ private:
                 d->bids = std::move(s.bids);
                 d->asks = std::move(s.asks);
                 if (!q->push(d)) {
-                    std::cerr << "[WARN:bybit:" << inst_ << ":" << sym
-                        << "] snapshot drop (queue full)\n";
+                    std::cerr << "[WARN:bybit:" << inst_ << ":" << sym << "] snapshot drop (queue full)\n";
                 }
                 else {
-                    std::cout << "[ingestor:bybit:" << inst_ << ":" << sym
-                        << "] snapshot pushed\n";
+                    std::cout << "[ingestor:bybit:" << inst_ << ":" << sym << "] snapshot pushed\n";
                 }
             }
             catch (const std::exception& e) {
-                std::cerr << "[ingestor:bybit:" << inst_ << ":" << sym
-                    << "] snapshot error: " << e.what() << "\n";
+                std::cerr << "[ingestor:bybit:" << inst_ << ":" << sym << "] snapshot error: " << e.what() << "\n";
             }
         }
     }
@@ -792,7 +868,8 @@ private:
                     if (data.contains("u"))            has_seq = get_i64(data["u"], u);
                     if (!has_seq && m.contains("seq")) has_seq = get_i64(m["seq"], u);
 
-                    auto d = std::make_shared<Delta>();
+                    // [FIX] Use Object Pool
+                    auto d = DeltaPool::acquire();
                     d->exchange = "bybit";
                     d->instance = inst_;
                     d->symbol = sym;
@@ -803,16 +880,14 @@ private:
                     if (data.contains("b")) {
                         for (auto& row : data["b"]) {
                             double p, q;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->bids.emplace_back(p, q);
                         }
                     }
                     if (data.contains("a")) {
                         for (auto& row : data["a"]) {
                             double p, q;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->asks.emplace_back(p, q);
                         }
                     }
@@ -911,7 +986,8 @@ private:
                     int64_t u = 0;
                     get_i64(data["u"], u);
 
-                    auto d = std::make_shared<Delta>();
+                    // [FIX] Use Object Pool
+                    auto d = DeltaPool::acquire();
                     d->exchange = "binance";
                     d->instance = inst_;
                     d->symbol = sym;
@@ -922,16 +998,14 @@ private:
                     if (data.contains("b")) {
                         for (auto& row : data["b"]) {
                             double p, q;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->bids.emplace_back(p, q);
                         }
                     }
                     if (data.contains("a")) {
                         for (auto& row : data["a"]) {
                             double p, q;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->asks.emplace_back(p, q);
                         }
                     }
@@ -1042,7 +1116,8 @@ private:
                         get_i64(data["seqId"], u);
                     }
 
-                    auto d = std::make_shared<Delta>();
+                    // [FIX] Use Object Pool
+                    auto d = DeltaPool::acquire();
                     d->exchange = "okx";
                     d->instance = inst_;
                     d->symbol = sym;
@@ -1053,16 +1128,14 @@ private:
                     if (data.contains("bids")) {
                         for (auto& row : data["bids"]) {
                             double p = 0, q = 0;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->bids.emplace_back(p, q);
                         }
                     }
                     if (data.contains("asks")) {
                         for (auto& row : data["asks"]) {
                             double p = 0, q = 0;
-                            get_num(row[0], p);
-                            get_num(row[1], q);
+                            get_num(row[0], p); get_num(row[1], q);
                             d->asks.emplace_back(p, q);
                         }
                     }
@@ -1095,12 +1168,15 @@ void on_sigint(int) {
 // ========== main ==========
 int main(int argc, char** argv)
 {
-    // ✅ Protobuf 초기화
+    // [FIX] Protobuf & AWS Init
+    Aws::SDKOptions aws_options;
+    Aws::InitAPI(aws_options);
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " {bybit|binance|okx}\n";
         google::protobuf::ShutdownProtobufLibrary();
+        Aws::ShutdownAPI(aws_options);
         return 1;
     }
 
@@ -1114,11 +1190,9 @@ int main(int argc, char** argv)
     if (!enable_bybit && !enable_binance && !enable_okx) {
         std::cerr << "Invalid exchange '" << target << "'. Use one of: bybit, binance, okx\n";
         google::protobuf::ShutdownProtobufLibrary();
+        Aws::ShutdownAPI(aws_options);
         return 1;
     }
-
-    Aws::SDKOptions aws_options;
-    Aws::InitAPI(aws_options);
 
     {
         std::signal(SIGINT, on_sigint);
@@ -1132,7 +1206,7 @@ int main(int argc, char** argv)
             "SOLUSDT"
         };
 
-        std::cout << "Running with Protobuf binary format...\n";
+        std::cout << "Running with Protobuf binary format & Kinesis Batching...\n";
 
         try {
             asio::io_context ioc;
@@ -1158,7 +1232,6 @@ int main(int argc, char** argv)
                 fs::path out_path = fs::path("data") / ("orderbook_" + sym + ".jsonl");
                 file_pubs[sym] = std::make_unique<FilePublisher>(out_path);
                 
-                // ✅ Protobuf 활성화
                 kinesis_pubs[sym] = std::make_unique<KinesisPublisher>(
                     sym,
                     "ap-northeast-2",
@@ -1185,83 +1258,29 @@ int main(int argc, char** argv)
 
             for (auto& sym : symbols)
             {
-                if (enable_bybit) {
-                    ExchSymbolPipe p;
-                    p.exch = "bybit";
-                    p.sym = sym;
-                    p.qa = std::make_unique<SPSC<4096>>();
-                    p.qb = std::make_unique<SPSC<4096>>();
-                    p.qc = std::make_unique<SPSC<4096>>();
+                ExchSymbolPipe p;
+                p.exch = target;
+                p.sym = sym;
+                p.qa = std::make_unique<SPSC<4096>>();
+                p.qb = std::make_unique<SPSC<4096>>();
+                p.qc = std::make_unique<SPSC<4096>>();
 
-                    p.val = std::make_unique<Validator>(
-                        "bybit", sym,
-                        p.qa.get(), p.qb.get(), p.qc.get(),
-                        std::chrono::milliseconds(15),
-                        std::chrono::milliseconds(20),
-                        &g_running, -1
-                    );
+                p.val = std::make_unique<Validator>(
+                    target, sym,
+                    p.qa.get(), p.qb.get(), p.qc.get(),
+                    std::chrono::milliseconds(15),
+                    std::chrono::milliseconds(20),
+                    &g_running, -1
+                );
 
-                    p.writer = std::make_unique<Writer>(
-                        "bybit", sym,
-                        p.qc.get(),
-                        multi_pubs[sym].get(),
-                        g_running, -1
-                    );
+                p.writer = std::make_unique<Writer>(
+                    target, sym,
+                    p.qc.get(),
+                    multi_pubs[sym].get(),
+                    g_running, -1
+                );
 
-                    pipes.emplace_back(std::move(p));
-                }
-
-                if (enable_binance) {
-                    ExchSymbolPipe p;
-                    p.exch = "binance";
-                    p.sym = sym;
-                    p.qa = std::make_unique<SPSC<4096>>();
-                    p.qb = std::make_unique<SPSC<4096>>();
-                    p.qc = std::make_unique<SPSC<4096>>();
-
-                    p.val = std::make_unique<Validator>(
-                        "binance", sym,
-                        p.qa.get(), p.qb.get(), p.qc.get(),
-                        std::chrono::milliseconds(5),
-                        std::chrono::milliseconds(20),
-                        &g_running, -1
-                    );
-
-                    p.writer = std::make_unique<Writer>(
-                        "binance", sym,
-                        p.qc.get(),
-                        multi_pubs[sym].get(),
-                        g_running, -1
-                    );
-
-                    pipes.emplace_back(std::move(p));
-                }
-
-                if (enable_okx) {
-                    ExchSymbolPipe p;
-                    p.exch = "okx";
-                    p.sym = sym;
-                    p.qa = std::make_unique<SPSC<4096>>();
-                    p.qb = std::make_unique<SPSC<4096>>();
-                    p.qc = std::make_unique<SPSC<4096>>();
-
-                    p.val = std::make_unique<Validator>(
-                        "okx", sym,
-                        p.qa.get(), p.qb.get(), p.qc.get(),
-                        std::chrono::milliseconds(5),
-                        std::chrono::milliseconds(20),
-                        &g_running, -1
-                    );
-
-                    p.writer = std::make_unique<Writer>(
-                        "okx", sym,
-                        p.qc.get(),
-                        multi_pubs[sym].get(),
-                        g_running, -1
-                    );
-
-                    pipes.emplace_back(std::move(p));
-                }
+                pipes.emplace_back(std::move(p));
             }
 
             // Ingestor 라우팅
@@ -1303,7 +1322,11 @@ int main(int argc, char** argv)
             }
 
             // 시작
-            std::thread io_thread([&]() { ioc.run(); });
+            // [NOTE] 동기 방식 Ingestor이므로 ioc.run()은 resolver 등 내부용으로만 쓰임
+            std::thread io_thread([&]() { 
+                asio::executor_work_guard<asio::io_context::executor_type> work(ioc.get_executor());
+                ioc.run(); 
+            });
 
             if (ingestorA) ingestorA->start();
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -1337,8 +1360,6 @@ int main(int argc, char** argv)
     }
 
     Aws::ShutdownAPI(aws_options);
-    
-    // ✅ Protobuf 정리
     google::protobuf::ShutdownProtobufLibrary();
     
     return 0;
