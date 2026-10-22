@@ -236,9 +236,16 @@ class BybitStreamer(BaseStreamer):
                             continue
 
                         data = msg.get("data", {})
-                        # bybit는 b/a 가 델타로 옴
-                        lob.bids = {float(p): float(q) for p, q in data.get("b", [])}
-                        lob.asks = {float(p): float(q) for p, q in data.get("a", [])}
+                        # FIX: snapshot REPLACES the book; delta UPSERTS (size==0 deletes).
+                        # (Previously this replaced the book on every delta, collapsing it.)
+                        if msg.get("type") == "snapshot":
+                            lob.bids = defaultdict(float,
+                                {float(p): float(q) for p, q in data.get("b", []) if float(q) > 0})
+                            lob.asks = defaultdict(float,
+                                {float(p): float(q) for p, q in data.get("a", []) if float(q) > 0})
+                        else:  # "delta"
+                            lob.upsert_side(lob.bids, data.get("b", []))
+                            lob.upsert_side(lob.asks, data.get("a", []))
                         ts = float(data.get("t", time.time() * 1000))
                         lob.last_update_id = int(data.get("u", ts))
 
